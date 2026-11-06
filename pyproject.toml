@@ -12,10 +12,13 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "vllm-ascend contributors" }]
 dependencies = [
     "numpy",
-    # The plugin monkey-patches vllm-ascend at runtime; it must already be
-    # importable. Install vllm-ascend from source first, or rely on this spec
-    # only if a matching build is available on the index.
-    "vllm_ascend",
+    # NOTE: vllm_ascend is deliberately NOT declared as a dependency. It is
+    # monkey-patched at runtime and must already be installed from source
+    # (editable) in the target environment. Declaring it here would make
+    # `pip install -e .` pull the PyPI ``vllm-ascend`` build (0.23.0/0.30.0),
+    # which can shadow or clobber the local source checkout. ``apply()`` logs a
+    # warning and no-ops when vllm-ascend is absent, so the dependency is not
+    # needed for the plugin to be importable or unit-testable.
 ]
 
 [project.optional-dependencies]
