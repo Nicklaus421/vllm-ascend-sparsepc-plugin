@@ -87,6 +87,7 @@ __all__ = [
     "publish_sparse_positions",
     "restore_checkpoint_state",
     "set_sparse_prefix_cache_hook",
+    "register",
     "solve_dp",
 ]
 
@@ -102,18 +103,23 @@ def apply() -> None:
     patch.apply()
 
 
-# Auto-apply the monkey-patches on import. Guarded so that a missing vllm /
-# vllm-ascend installation only surfaces as a warning (the algorithm modules
-# above remain importable and unit-testable without a full runtime).
-try:
-    apply()
-except ImportError as exc:  # pragma: no cover - depends on runtime env
-    import warnings
+def register() -> None:
+    """Entry point for vllm's ``vllm.general_plugins`` group.
 
-    warnings.warn(
-        f"vllm-ascend-sparse-pc: monkey-patches not applied because a "
-        f"dependency is missing ({exc}). Import vllm-ascend first, or call "
-        f"``vllm_ascend_sparse_pc.apply()`` after it is available.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+    vllm discovers and calls this automatically when it starts, which is what
+    makes the patch take effect in the engine-core process without any launcher
+    code change. Worker-side patches are applied both here (if vllm also loads
+    general plugins in workers) and via the multiproc-executor worker entry
+    point (``patch._sparse_worker_main``), so they are reliable regardless of
+    vllm's plugin-loading order. The auto-apply on import above already runs for
+    a manual import; this hook exists so vllm can load the plugin without any
+    code change to the launcher.
+    """
+    apply()
+
+
+# Auto-apply the monkey-patches on import. ``apply()`` is resilient: any patch
+# whose vllm/vllm-ascend target is not importable in this process is skipped
+# with a warning and retried on the next ``apply()`` call, so the algorithm
+# modules above remain importable and unit-testable without a full runtime.
+apply()

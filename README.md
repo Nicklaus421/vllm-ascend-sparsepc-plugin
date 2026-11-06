@@ -35,23 +35,45 @@ imported.
 
 ## Activate
 
-The patch is applied on import:
+`pip install -e .` registers a `vllm.general_plugins` entry point
+(`ascend_sparse_pc = vllm_ascend_sparse_pc:register`). vllm loads general
+plugins when it starts, so the monkey-patches are applied automatically in the
+engine-core and worker processes — no launcher code change and no explicit
+import are required.
+
+Two things are required for the patch to actually take effect:
+
+1. The master switch must be on (the plugin reads its own env vars):
+
+   ```bash
+   export VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED=1
+   export VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY=fixed_interval
+   ```
+
+2. The plugin must be installed into the same Python environment vllm runs
+   from (`pip install -e .`).
+
+For a manual import (e.g. in a script that then starts vllm), importing the
+package applies the patches directly:
 
 ```python
 import vllm_ascend_sparse_pc  # noqa: F401  applies the monkey-patches
 ```
 
-If vllm / vllm-ascend are imported only *after* this package (e.g. a lazy
-import ordering in a launcher), call the patch explicitly once both are
-available:
+`apply()` is idempotent and safe to call repeatedly.
 
-```python
-import vllm_ascend
-import vllm_ascend_sparse_pc
-vllm_ascend_sparse_pc.apply()
+### Verify it took effect
+
+Confirm the entry point is registered:
+
+```bash
+python -c "import importlib.metadata as m; print([e.value for e in m.entry_points(group='vllm.general_plugins') if 'sparse' in e.name])"
 ```
 
-`apply()` is idempotent and safe to call repeatedly.
+At runtime, the worker log should contain
+`Sparse prefix cache enabled (interval=... tokens).`; with
+`STRATEGY=hist_exp_decay`, the engine-core log should eventually contain
+`Sparse prefix cache: solved DP placement ...` after warmup.
 
 ## Configuration
 

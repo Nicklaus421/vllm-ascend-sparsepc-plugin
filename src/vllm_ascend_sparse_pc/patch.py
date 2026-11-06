@@ -38,11 +38,17 @@ patches would double-apply.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from vllm_ascend_sparse_pc import envs
 
-_APPLIED = False
+logger = logging.getLogger(__name__)
+
+# Names of the integration points that have been applied in this process.
+# ``apply()`` uses this to stay idempotent while still applying each patch
+# independently, so a process-specific import failure does not block the others.
+_APPLIED: set[str] = set()
 
 
 def _is_enabled() -> bool:
@@ -512,28 +518,54 @@ def _patch_model_runner() -> None:
 # ---------------------------------------------------------------------------
 # 3. Multiproc executor (cross-process shared state)
 # ---------------------------------------------------------------------------
+def _sparse_worker_main(**kwargs: Any):
+    """Worker entry point substituted for ``WorkerProc.worker_main``.
+
+    Runs in each spawned TP worker before the real worker main. It (1)
+    re-attaches the cross-process ``multiprocessing.Manager`` proxy carrying the
+    frozen DP checkpoint positions and (2) re-applies the plugin patches in this
+    process. vllm loads ``vllm.general_plugins`` in every process (including
+    workers), so the patches normally arrive via that path too; the explicit
+    ``apply()`` here is a belt-and-suspenders that also makes the patch reliable
+    if a deployment uses a non-standard plugin-loading path.
+
+    This must stay a module-level function: it is passed as ``target`` to
+    ``multiprocessing.Process`` and therefore has to be picklable (a nested
+    function would fail under the ``spawn`` start method).
+    """
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+
+    from vllm_ascend_sparse_pc.shared import attach_sparse_shared_state
+
+    proxy = kwargs.pop("sparse_shared_state", None)
+    if proxy is not None:
+        attach_sparse_shared_state(proxy)
+
+    # Idempotent: applies any patch not yet active in this process.
+    apply()
+
+    return WorkerProc.worker_main(**kwargs)
+
+
 def _patch_multiproc_executor() -> None:
+    # The cross-process Manager proxy is only needed for the DP (hist_exp_decay)
+    # strategy; fixed_interval is prefix-consistent with no shared state.
+    # Importing ``patch_multiproc_executor`` also swaps in
+    # ``AscendMultiprocExecutor``, so avoid that side effect unless it is
+    # actually required.
+    if (
+        not envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED
+        or envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY != "hist_exp_decay"
+    ):
+        return
+
     from vllm.config import VllmConfig
     from vllm.utils.system_utils import get_mp_context
 
-    from vllm.v1.executor.multiproc_executor import (
-        UnreadyWorkerProcHandle,
-        WorkerProc,
-    )
+    from vllm.v1.executor.multiproc_executor import UnreadyWorkerProcHandle
 
     from vllm_ascend.patch.platform import patch_multiproc_executor as mod
-    from vllm_ascend_sparse_pc.shared import (
-        attach_sparse_shared_state,
-        init_sparse_shared_state,
-    )
-
-    orig_worker_main = WorkerProc.worker_main
-
-    def _sparse_worker_main(**kwargs: Any):
-        proxy = kwargs.pop("sparse_shared_state", None)
-        if proxy is not None:
-            attach_sparse_shared_state(proxy)
-        return orig_worker_main(**kwargs)
+    from vllm_ascend_sparse_pc.shared import init_sparse_shared_state
 
     proc_cls = mod.AscendWorkerProc
 
@@ -603,19 +635,32 @@ def _patch_multiproc_executor() -> None:
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-def apply() -> None:
-    """Apply all monkey-patches. Idempotent; safe to call more than once."""
-    global _APPLIED
-    if _APPLIED:
-        return
-    _APPLIED = True
+_PATCHES: tuple[tuple[str, Any], ...] = (
+    ("kv_cache_coordinator", _patch_kv_cache_coordinator),
+    ("model_runner", _patch_model_runner),
+    ("multiproc_executor", _patch_multiproc_executor),
+)
 
-    try:
-        _patch_kv_cache_coordinator()
-        _patch_model_runner()
-        _patch_multiproc_executor()
-    except ImportError:
-        # vllm-ascend (or vllm) not installed/importable: this plugin is a
-        # no-op until both are available. Re-arm so a later ``apply()`` retries.
-        _APPLIED = False
-        raise
+
+def apply() -> None:
+    """Apply all monkey-patches. Idempotent; safe to call more than once.
+
+    Each integration point is applied independently: if one target module is not
+    importable in this process (e.g. the worker-only model runner in the
+    engine-core process), the others still apply, and the failed one is retried
+    on the next ``apply()`` call.
+    """
+    for name, patch_fn in _PATCHES:
+        if name in _APPLIED:
+            continue
+        try:
+            patch_fn()
+        except (ImportError, AttributeError) as exc:
+            logger.warning(
+                "vllm-ascend-sparse-pc: skipped %s patch (%s). "
+                "It will be retried on the next apply().",
+                name,
+                exc,
+            )
+        else:
+            _APPLIED.add(name)

@@ -21,6 +21,12 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 
+# Auto-load the monkey-patches when vllm starts. vllm discovers these entry
+# points in both the engine-core and worker processes, so the coordinator patch
+# and the model-runner patch both take effect without any launcher change.
+[project.entry-points."vllm.general_plugins"]
+ascend_sparse_pc = "vllm_ascend_sparse_pc:register"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
