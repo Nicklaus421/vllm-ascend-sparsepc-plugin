@@ -55,6 +55,44 @@ def _is_enabled() -> bool:
     return bool(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED)
 
 
+def _preimport_ascend_ops() -> None:
+    """Break a latent vllm-ascend circular import before patching.
+
+    ``vllm_ascend.ops.fused_moe.experts_selector`` imports
+    ``vllm_ascend.device.device_op`` at module top level, which in turn imports
+    ``vllm_ascend.ops.triton.fla`` and therefore re-enters ``vllm_ascend.ops``
+    while the package ``__init__`` is still executing::
+
+        ops/__init__            -> import fused_moe
+        fused_moe               -> from experts_selector import select_experts
+        experts_selector        -> from device_op import DeviceOperator
+        device_op               -> from ops.triton.fla.chunk_scaled_dot_kkt import ...
+        ops/__init__ (re-entry) -> import fused_moe
+        fused_moe               -> from experts_selector import select_experts
+                                    ^ experts_selector is still partially
+                                      initialized (select_experts undefined)
+
+    This cycle is harmless when ``vllm_ascend.ops`` is imported *first*: the
+    triton ``fla`` submodules have no back-edge to ``experts_selector``, so
+    ``ops/__init__`` completes and ``select_experts`` is defined before any
+    ``vllm_ascend.quantization`` -> ``w4a8_mxfp4`` -> ``experts_selector`` path
+    runs. The plugin's entry point fires during vllm's general-plugin load,
+    ahead of ``NPUPlatform.pre_register_and_update`` (which imports
+    ``vllm_ascend.quantization``), so we eagerly initialise ``ops`` here to
+    establish the safe order and avoid leaving a partially-initialised module in
+    ``sys.modules``.
+    """
+    try:
+        import vllm_ascend.ops  # noqa: F401
+    except (ImportError, AttributeError) as exc:
+        # Only reachable outside a vllm runtime (e.g. CPU unit tests). The
+        # per-patch import guards below handle that case too.
+        logger.debug(
+            "vllm-ascend-sparse-pc: could not pre-import vllm_ascend.ops (%s).",
+            exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. KV-cache coordinator
 # ---------------------------------------------------------------------------
@@ -650,6 +688,7 @@ def apply() -> None:
     engine-core process), the others still apply, and the failed one is retried
     on the next ``apply()`` call.
     """
+    _preimport_ascend_ops()
     for name, patch_fn in _PATCHES:
         if name in _APPLIED:
             continue
