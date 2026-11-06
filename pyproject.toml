@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ascend-sparse-pc"
+version = "0.1.0"
+description = "Sparse Prefix Caching for Hybrid and Recurrent LLM Serving (arXiv:2605.05219) — a monkey-patch plugin for vllm-ascend."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "vllm-ascend contributors" }]
+dependencies = [
+    "numpy",
+    # The plugin monkey-patches vllm-ascend at runtime; it must already be
+    # importable. Install vllm-ascend from source first, or rely on this spec
+    # only if a matching build is available on the index.
+    "vllm_ascend",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
