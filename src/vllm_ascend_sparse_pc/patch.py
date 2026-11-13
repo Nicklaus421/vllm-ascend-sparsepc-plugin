@@ -25,7 +25,7 @@ Three integration points are patched:
 
 1. ``AscendHybridKVCacheCoordinator`` (``patch_kv_cache_coordinator.py``)
    — resolve sparse Mamba hits and drive the DP-optimal placement.
-2. ``NPUModelRunner`` (``worker/v1/model_runner.py``)
+2. ``NPUModelRunner`` (``worker/model_runner_v1.py``)
    — capture recurrent-state checkpoints after a prefill and restore them
    before a recompute prefill.
 3. ``AscendWorkerProc`` / ``WorkerProc`` (``patch_multiproc_executor.py``)
@@ -377,7 +377,7 @@ def _patch_model_runner() -> None:
     from vllm.logger import logger
     from vllm.v1.kv_cache_interface import MambaSpec
 
-    from vllm_ascend.worker.v1 import model_runner as mod
+    from vllm_ascend.worker import model_runner_v1 as mod
     from vllm_ascend_sparse_pc.checkpoint import RecurrentCheckpoint
     from vllm_ascend_sparse_pc.coordinator import get_checkpoint_positions
     from vllm_ascend_sparse_pc.runner import (

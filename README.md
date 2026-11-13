@@ -104,7 +104,7 @@ Three integration points are patched (see `src/vllm_ascend_sparse_pc/patch.py`):
    branch is injected into `find_longest_cache_hit` so the hybrid hit is the
    nearest checkpoint `C <= P` rather than a dense Mamba block run.
 
-2. **`NPUModelRunner`** (`vllm_ascend.worker.v1.model_runner`)
+2. **`NPUModelRunner`** (`vllm_ascend.worker.model_runner_v1`)
    — `__init__` is wrapped to add the per-process state buffer; capture runs
    after prefill (`_update_states_after_model_execute`) and restore runs before
    the forward (`_update_states`).
