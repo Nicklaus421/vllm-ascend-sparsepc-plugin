@@ -29,7 +29,7 @@ block to the store" and restore is "copy from the store to a live block" —
 exactly what ``preprocess_mamba`` / ``postprocess_mamba`` do between two live
 blocks, but across requests via a checkpoint.
 
-The actual call sites live in ``vllm_ascend/worker/model_runner_v1.py`` and the
+The actual call sites live in ``vllm_ascend/worker/v1/model_runner.py`` and the
 KV-cache coordinator; see the design doc's "Integration points" section. This
 module keeps the tensor logic isolated so it can be reviewed and unit-tested
 without the full runner.

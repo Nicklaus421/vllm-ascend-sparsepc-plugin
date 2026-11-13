@@ -25,7 +25,7 @@ Three integration points are patched:
 
 1. ``AscendHybridKVCacheCoordinator`` (``patch_kv_cache_coordinator.py``)
    — resolve sparse Mamba hits and drive the DP-optimal placement.
-2. ``NPUModelRunner`` (``model_runner_v1.py``)
+2. ``NPUModelRunner`` (``worker/v1/model_runner.py``)
    — capture recurrent-state checkpoints after a prefill and restore them
    before a recompute prefill.
 3. ``AscendWorkerProc`` / ``WorkerProc`` (``patch_multiproc_executor.py``)
@@ -114,10 +114,10 @@ def _resolve_sparse_mamba_hit(overlap_depth: int) -> int | None:
 
 def _patch_kv_cache_coordinator() -> None:
     from vllm.logger import logger
+    from vllm.utils.math_utils import cdiv
     from vllm.v1.core.kv_cache_utils import (
         BlockHash,
         BlockHashList,
-        BlockHashListWithBlockSize,
         KVCacheBlock,
     )
     from vllm.v1.kv_cache_interface import (
@@ -253,33 +253,25 @@ def _patch_kv_cache_coordinator() -> None:
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | tuple[tuple[list[KVCacheBlock], ...], int, int]:
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            target_block_size = kv_cache_spec.block_size
-            if (
-                not isinstance(kv_cache_spec, MambaSpec)
-                and self.dcp_world_size * self.pcp_world_size > 1
-            ):
-                target_block_size *= self.dcp_world_size * self.pcp_world_size
-            if target_block_size == self.hash_block_size:
-                return block_hashes
-            return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, target_block_size
-            )
+            return block_hashes
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
+        longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
+        hit_length_by_group: list[int] = [0] * num_groups
 
         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
-            self.attention_groups[0][0], FullAttentionSpec
+            self.attention_groups[0].spec, FullAttentionSpec
         )
 
         eagle_verified: set[int] = set()
 
         while True:
             curr_hit_length = hit_length
-            for idx, (spec, group_ids, manager_cls) in enumerate(
+            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
                 self.attention_groups
             ):
                 # SPARSE-PREFIX-CACHE: the recurrent state is only checkpointed
@@ -295,46 +287,61 @@ def _patch_kv_cache_coordinator() -> None:
                         curr_hit_length = sparse_hit_length
                         for group_id in group_ids:
                             hit_blocks_by_group[group_id] = []
+                            hit_length_by_group[group_id] = curr_hit_length
                         continue
 
-                effective_block_size = self._get_effective_block_size(spec)
-                cached_blocks = hit_blocks_by_group[group_ids[0]]
+                group_block_size = self._get_effective_block_size(spec)
+                first_group_id = group_ids[0]
+                cached_blocks = hit_blocks_by_group[first_group_id]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
-                    num_blocks = curr_hit_length // effective_block_size
-                    curr_hit_length = num_blocks * effective_block_size
+                    # Full attention is downward-closed: we only need to look
+                    # up cached blocks once; on subsequent iterations just trim
+                    # to the (reduced) current hit length.
+                    curr_hit_length = min(
+                        curr_hit_length, hit_length_by_group[first_group_id]
+                    )
                     continue
 
-                use_eagle = (
-                    idx in self.eagle_attn_group_indices
+                drop_eagle_block = (
+                    use_eagle
                     and idx not in eagle_verified
+                    and not self.skips_eagle_block_drop
                 )
 
                 _max_length = curr_hit_length
-                if use_eagle and not isinstance(spec, MambaSpec):
-                    _max_length = min(
-                        curr_hit_length + spec.block_size, max_cache_hit_length
+                if drop_eagle_block and not isinstance(spec, MambaSpec):
+                    eagle_margin = (
+                        self.hash_block_size
+                        if self.enable_partial_hash_hits
+                        and manager_cls.supports_fine_grained_hash_lookup
+                        and group_block_size > self.hash_block_size
+                        else group_block_size
                     )
-                eagle_kwarg = {"drop_eagle_block": use_eagle}
-                hit_blocks = manager_cls.find_longest_cache_hit(
+                    _max_length = min(
+                        curr_hit_length + eagle_margin, max_cache_hit_length
+                    )
+                hit_result = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
                     kv_cache_spec=spec,
-                    **eagle_kwarg,
-                    alignment_tokens=self.lcm_block_size,
+                    drop_eagle_block=drop_eagle_block,
+                    alignment_tokens=self._cache_hit_alignment_tokens,
                     dcp_world_size=self.dcp_world_size,
-                    pcp_world_size=self.pcp_world_size,
+                    pcp_world_size=1,
                 )
-                _new_hit_length = len(hit_blocks[0]) * effective_block_size
-                if use_eagle:
+                hit_blocks, _new_hit_length = hit_result
+                if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     eagle_verified.clear()
                 curr_hit_length = _new_hit_length
-                curr_hit_length = len(hit_blocks[0]) * effective_block_size
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
+                    hit_length_by_group[group_id] = _new_hit_length
+
+                longest_hit_length = max(longest_hit_length, curr_hit_length)
 
             if curr_hit_length >= hit_length:
                 break
@@ -342,17 +349,23 @@ def _patch_kv_cache_coordinator() -> None:
             if is_simple_hybrid:
                 break
 
-        spec, group_ids, _ = self.attention_groups[0]
-        if isinstance(spec, FullAttentionSpec):
-            num_blocks = hit_length // self._get_effective_block_size(spec)
-            for group_id in group_ids:
+        # Truncate all full attention groups to the final hit_length.
+        for group in self.attention_groups:
+            if not isinstance(group.spec, FullAttentionSpec):
+                continue
+            num_blocks = cdiv(
+                hit_length,
+                self._get_effective_block_size(group.spec),
+            )
+            for group_id in group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
+                    hit_length_by_group[group_id] = hit_length
 
-        return (
-            tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group),
-            hit_length,
+        cache_hit_blocks = tuple(
+            blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        return cache_hit_blocks, hit_length, longest_hit_length - hit_length
 
     cls.find_longest_cache_hit = find_longest_cache_hit
 
@@ -364,7 +377,7 @@ def _patch_model_runner() -> None:
     from vllm.logger import logger
     from vllm.v1.kv_cache_interface import MambaSpec
 
-    from vllm_ascend.worker import model_runner_v1 as mod
+    from vllm_ascend.worker.v1 import model_runner as mod
     from vllm_ascend_sparse_pc.checkpoint import RecurrentCheckpoint
     from vllm_ascend_sparse_pc.coordinator import get_checkpoint_positions
     from vllm_ascend_sparse_pc.runner import (
